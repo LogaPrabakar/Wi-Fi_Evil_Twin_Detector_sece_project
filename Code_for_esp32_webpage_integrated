@@ -1,0 +1,261 @@
+// === ESP32 Evil Twin Attack Detector + Web Dashboard (No ArduinoJson) ===
+
+#include <WiFi.h>
+#include <WebServer.h>
+#include <vector>
+#include <map>
+#include <set>
+#include <algorithm>
+
+// ================= CONFIG ==================
+const char* WIFI_SSID = "DEVICE NAME";      // <-- Change this
+const char* WIFI_PASS = "PASSWORD";    // <-- Change this
+
+const unsigned long SCAN_INTERVAL = 5000; // 5s
+const unsigned long CLEANUP_INTERVAL = 300000; // 5min
+const int MAX_ENTRIES = 300;
+const int MIN_RSSI = -85;
+const int RSSI_VARIATION_THRESHOLD = 20;
+const int SIMULTANEOUS_SSID_THRESHOLD = 2;
+
+WebServer server(80);
+
+// ================ DATA STRUCTURES =================
+struct AccessPoint {
+  String ssid;
+  String bssid;
+  int rssi;
+  int channel;
+  bool encryption;
+  unsigned long firstSeen;
+  unsigned long lastSeen;
+  std::vector<int> rssiHistory;
+};
+
+struct SSIDAnalysis {
+  String ssid;
+  std::vector<String> bssids;
+  std::vector<int> channels;
+  std::vector<bool> encryptions;
+  int occurrenceCount;
+};
+
+std::vector<AccessPoint> knownAPs;
+std::map<String, SSIDAnalysis> ssidAnalysis;
+
+// NEW: set of SSIDs considered evil (same SSID with different MACs or differing encryption)
+std::set<String> evilSsids;
+
+unsigned long lastScan = 0;
+unsigned long lastCleanup = 0;
+unsigned long lastAnalysis = 0;
+int evilTwinCount = 0;
+int warningCount = 0;
+int openCount = 0;
+int encryptedCount = 0;
+
+// ================= FUNCTION DECLARATIONS ================
+void updateAccessPoint(const String&, const String&, int, int, bool);
+void analyzeNetworks();
+void checkRSSISpoofing();
+void cleanupOldEntries();
+void printStatistics();
+void handleRoot();
+void handleAps();
+void handleStats();
+void performScan();
+
+// ================= HTML DASHBOARD =================
+const char MAIN_page[] PROGMEM = R"rawliteral(
+<!doctype html><html lang="en"><head><meta charset="utf-8"/><meta name="viewport"content="width=device-width,initial-scale=1"/>
+<title>ESP32 Evil Twin Dashboard</title>
+<style>:root{font-family:Inter,system-ui,-apple-system,"Segoe UI",Roboto,Arial;--bg:#0f1724;--card:#0b1220;--muted:#9aa4b2}
+body{margin:0;background:linear-gradient(180deg,#071129,#081426);color:#e6eef6}header{display:flex;justify-content:space-between;padding:10px 20px}
+.btn{padding:6px 10px;border-radius:6px;border:1px solid rgba(255,255,255,.1);background:transparent;color:#e6eef6;cursor:pointer}
+.card{margin:20px;background:rgba(255,255,255,.03);padding:12px;border-radius:12px}
+.ap{display:flex;justify-content:space-between;border-bottom:1px solid rgba(255,255,255,.05);padding:8px}
+.ssid{font-weight:600}.bssid{font-size:12px;color:#9aa4b2}
+.badge{color:#ffcc00;font-weight:700;margin-left:8px}
+</style></head><body>
+<header><h3>ESP32 Evil Twin Dashboard</h3><button id="refresh" class="btn">Refresh</button></header>
+<div class="card">
+<div><b>Total APs:</b> <span id="total">--</span> | <b>Warnings:</b> <span id="warn">--</span> | <b>Evil Twins:</b> <span id="evil">--</span></div>
+<div id="list"></div></div>
+<script>
+async function load(){
+  let a = await fetch('/api/aps'); let d = await a.json();
+  let s = await fetch('/api/stats'); let t = await s.json();
+  document.getElementById('total').textContent = t.totalAps;
+  document.getElementById('warn').textContent = t.warnings;
+  document.getElementById('evil').textContent = t.eviltwins;
+  let list = document.getElementById('list'); list.innerHTML = '';
+  d.forEach(ap => {
+    let div = document.createElement('div'); div.className = 'ap';
+    let evilBadge = ap.evil ? "<span class='badge'>⚠️ Evil Twin</span>" : "";
+    div.innerHTML = `<div>
+        <div class='ssid'>${ap.ssid||'<hidden>'} ${evilBadge}</div>
+        <div class='bssid'>${ap.bssid} • ch${ap.channel} • ${ap.encryption?'Encrypted':'Open'}</div>
+      </div>
+      <div>${ap.rssi} dBm</div>`;
+    list.appendChild(div);
+  });
+}
+document.getElementById('refresh').onclick = load; load(); setInterval(load,5000);
+</script></body></html>
+)rawliteral";
+
+// ================= SETUP =================
+void setup() {
+  Serial.begin(115200);
+  WiFi.mode(WIFI_STA);
+  WiFi.begin(WIFI_SSID, WIFI_PASS);
+
+  Serial.println("Connecting to WiFi...");
+  while (WiFi.status() != WL_CONNECTED) { delay(500); Serial.print("."); }
+  Serial.println("\nConnected!");
+  Serial.print("IP: "); Serial.println(WiFi.localIP());
+
+  server.on("/", handleRoot);
+  server.on("/api/aps", handleAps);
+  server.on("/api/stats", handleStats);
+  server.begin();
+
+  Serial.println("Server started.");
+}
+
+// ================= LOOP =================
+void loop() {
+  unsigned long now = millis();
+  server.handleClient();
+
+  if (now - lastScan >= SCAN_INTERVAL) {
+    performScan();
+    lastScan = now;
+  }
+
+  if (now - lastAnalysis >= 30000) {
+    analyzeNetworks();
+    checkRSSISpoofing();
+    printStatistics();
+    lastAnalysis = now;
+  }
+
+  if (now - lastCleanup >= CLEANUP_INTERVAL) {
+    cleanupOldEntries();
+    lastCleanup = now;
+  }
+}
+
+// ================= CORE FUNCTIONS =================
+void performScan() {
+  int n = WiFi.scanNetworks(false, true);
+  for (int i = 0; i < n; i++) {
+    if (WiFi.RSSI(i) < MIN_RSSI) continue;
+    updateAccessPoint(WiFi.SSID(i), WiFi.BSSIDstr(i), WiFi.RSSI(i), WiFi.channel(i), WiFi.encryptionType(i) != WIFI_AUTH_OPEN);
+  }
+  WiFi.scanDelete();
+}
+
+void updateAccessPoint(const String &ssid, const String &bssid, int rssi, int channel, bool encryption) {
+  for (auto &ap : knownAPs) {
+    if (ap.bssid == bssid) {
+      ap.rssi = rssi;
+      ap.channel = channel;
+      ap.lastSeen = millis();
+      ap.rssiHistory.push_back(rssi);
+      return;
+    }
+  }
+
+  if (knownAPs.size() >= MAX_ENTRIES) knownAPs.erase(knownAPs.begin());
+  knownAPs.push_back({ssid, bssid, rssi, channel, encryption, millis(), millis(), {rssi}});
+}
+
+void analyzeNetworks() {
+  ssidAnalysis.clear();
+  evilTwinCount = 0; warningCount = 0; openCount = 0; encryptedCount = 0;
+  evilSsids.clear();
+
+  for (auto &ap : knownAPs) {
+    if (ap.ssid == "") continue;
+    if (!ssidAnalysis.count(ap.ssid)) {
+      SSIDAnalysis a; a.ssid = ap.ssid; a.occurrenceCount = 0;
+      ssidAnalysis[ap.ssid] = a;
+    }
+    ssidAnalysis[ap.ssid].bssids.push_back(ap.bssid);
+    ssidAnalysis[ap.ssid].channels.push_back(ap.channel);
+    ssidAnalysis[ap.ssid].encryptions.push_back(ap.encryption);
+    ssidAnalysis[ap.ssid].occurrenceCount++;
+    if (ap.encryption) encryptedCount++; else openCount++;
+  }
+
+  for (auto &p : ssidAnalysis) {
+    auto &a = p.second;
+    if (a.occurrenceCount >= SIMULTANEOUS_SSID_THRESHOLD) warningCount++;
+
+    bool hasEnc = false, hasOpen = false;
+    for (bool e : a.encryptions) { if (e) hasEnc = true; else hasOpen = true; }
+    bool diffEnc = (hasEnc && hasOpen);
+
+    // detect unique BSSIDs for this SSID
+    std::set<String> uniqueBssids;
+    for (auto &b : a.bssids) uniqueBssids.insert(b);
+
+    // Mark as evil if encryption differs OR more than one distinct MAC for same SSID
+    if (diffEnc || uniqueBssids.size() > 1) {
+      evilTwinCount++;
+      evilSsids.insert(a.ssid);
+    }
+  }
+}
+
+void checkRSSISpoofing() { /* simplified placeholder */ }
+
+void cleanupOldEntries() {
+  unsigned long now = millis();
+  knownAPs.erase(
+    std::remove_if(knownAPs.begin(), knownAPs.end(),
+      [now](AccessPoint &ap){ return now - ap.lastSeen > CLEANUP_INTERVAL; }),
+    knownAPs.end());
+}
+
+void printStatistics() {
+  Serial.printf("APs:%d SSIDs:%d Evil:%d Warn:%d\n", knownAPs.size(), ssidAnalysis.size(), evilTwinCount, warningCount);
+}
+
+// ================= HTTP HANDLERS =================
+void handleRoot() {
+  server.send_P(200, "text/html", MAIN_page);
+}
+
+void handleAps() {
+  String json = "[";
+  for (size_t i = 0; i < knownAPs.size(); i++) {
+    auto &ap = knownAPs[i];
+    bool isEvil = (evilSsids.find(ap.ssid) != evilSsids.end());
+    json += "{";
+    json += "\"ssid\":\"" + String(ap.ssid) + "\",";
+    json += "\"bssid\":\"" + String(ap.bssid) + "\",";
+    json += "\"rssi\":" + String(ap.rssi) + ",";
+    json += "\"channel\":" + String(ap.channel) + ",";
+    json += "\"encryption\":" + String(ap.encryption ? "true" : "false") + ",";
+    json += "\"evil\":" + String(isEvil ? "true" : "false");
+    json += "}";
+    if (i < knownAPs.size() - 1) json += ",";
+  }
+  json += "]";
+  server.send(200, "application/json", json);
+}
+
+void handleStats() {
+  String json = "{";
+  json += "\"totalAps\":" + String(knownAPs.size()) + ",";
+  json += "\"uniqueSsids\":" + String(ssidAnalysis.size()) + ",";
+  json += "\"warnings\":" + String(warningCount) + ",";
+  json += "\"eviltwins\":" + String(evilTwinCount) + ",";
+  json += "\"encrypted\":" + String(encryptedCount) + ",";
+  json += "\"open\":" + String(openCount) + ",";
+  json += "\"overall\":\"" + String(evilTwinCount == 0 ? "GOOD" : "WARNING") + "\"";
+  json += "}";
+  server.send(200, "application/json", json);
+}
